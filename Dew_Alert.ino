@@ -3,7 +3,7 @@
 /*
  * DEW ALERT: Dew Point Detection and Warning System
  * -------------------------------------------------
- * Code by W.Witt; V1.00-beta-02; July 2016
+ * Code by W.Witt; V1.00-beta-03; July 2016
  *
  * The code below implements a dew point detection and warming system
  * It senses temperature and relative humidity, uses that data to
@@ -32,7 +32,7 @@
 
 // ----------------------------------------------------------------------------
 
-#define DEW_ALERT_VERSION_STRING "V1.00-beta-02"
+#define DEW_ALERT_VERSION_STRING "V1.00-beta-03"
 
 // ****************************************************************************
 
@@ -202,9 +202,11 @@ void setup () {
   indicatorLedSafe.attachSyncHandshake ( &ledHandshake, true );
   indicatorLedWarn.attachSyncHandshake ( &ledHandshake );
   indicatorLedDew. attachSyncHandshake ( &ledHandshake );
+  indicatorBuzzer. attachSyncHandshake ( &ledHandshake );
   indicatorLedSafe.initSyncHandshake ();
   indicatorLedWarn.initSyncHandshake ();
   indicatorLedDew. initSyncHandshake ();
+  indicatorBuzzer. initSyncHandshake ();
 #endif
 
   // Define the three temperature margin thresholds for the dew
@@ -218,7 +220,7 @@ void setup () {
   // Similarly, define three relative humidity thresholds for the
   // alternate dew point hysteresis filter (measurement unit for
   // input value is relative humidity percent)...
-  humidityFilter.defineThreshold ( 0, 65.0, 1.0 );  // DEW/WARN threshold:  65% +/- 1%
+  humidityFilter.defineThreshold ( 0, 70.0, 1.0 );  // DEW/WARN threshold:  70% +/- 1%
   humidityFilter.defineThreshold ( 1, 80.0, 1.0 );  // WARN/NEAR threshold: 80% +/- 1%
   humidityFilter.defineThreshold ( 2, 95.0, 1.0 );  // NEAR/SAFE threshold: 95% +/- 1%
   humidityFilter.initHistory ( 25.0 );  // arbitrarily start filter assuming 25% humidity
@@ -238,6 +240,10 @@ void setup () {
   // Run indicator lights and buzzer through a quick test to demonstrate
   // they all work...
   runIndicatorLedTest ();
+
+  // Display ready message and get user to press button to start (partly
+  // to test button works)...
+  displayReadyAndTestButton ();
 
   // Activate communication with primary environmental (temperature,
   // humidity) sensor...
@@ -290,12 +296,12 @@ void loop () {
   // to detection zone...
   marginToDewQuantized = dewPointMarginFilter.mapValueToZone ( marginToDewDegC );
   // Similarly, run relative humidity through hysteresis filter...
-  marginToH100Quantized = humidityFilter.zoneCount() -
+  marginToH100Quantized = humidityFilter.zoneCount() - 1 -
                           humidityFilter.mapValueToZone ( sensorHumidityPercent );
 
   // Take the worst case (smallest margin) of the two...
   effectiveMargin = min ( marginToDewQuantized, marginToH100Quantized );
-  humIsTrigger = marginToH100Quantized  < marginToDewQuantized;
+  humIsTrigger = marginToH100Quantized < marginToDewQuantized;
 
   // Map zone to new dew state...
   switch ( effectiveMargin ) {
@@ -335,11 +341,13 @@ void loop () {
     dewState = dewStateNext;
     switch ( dewState ) {
       case DP_SAFE:
-        indicatorLedSafe.turnHigh ();
-        indicatorLedWarn.turnOff  ();
-        indicatorLedDew. turnOff  ();
+        indicatorBuzzer .turnOff   ();
+        indicatorLedSafe.turnHigh  ();
+        indicatorLedWarn.turnOff   ();
+        indicatorLedDew. turnOff   ();
         break;
       case DP_NEAR:
+        indicatorBuzzer .turnOff   ();
         indicatorLedSafe.turnOff   ();
         indicatorLedWarn.oscillate ();
         indicatorLedDew. turnOff   ();
@@ -356,9 +364,9 @@ void loop () {
       case DP_DEW:
         if ( dewState == DP_DEW_ALARM ) indicatorBuzzer.turnOn  ();
         else                            indicatorBuzzer.turnOff ();
-        indicatorLedSafe.turnOff ();
-        indicatorLedWarn.turnOff ();
-        indicatorLedDew. blink   ();
+        indicatorLedSafe.turnOff   ();
+        indicatorLedWarn.turnOff   ();
+        indicatorLedDew. blink     ();
         break;
     }
   }
@@ -380,9 +388,6 @@ void loop () {
     );
     displayTimer.restart ();
   }
-
-  // Sleep a bit before next sense/update iteration...
-  delay ( 10 );
 
 }
 
@@ -489,6 +494,21 @@ void initDisplay () {
 
 // ----------------------------------------------------------------------------
 
+void displayReadyAndTestButton () {
+
+  lcd.clear ();
+  lcd.setCursor ( 0, 0 );
+  lcd.print ( "  READY! Press" );
+  lcd.setCursor ( 0, 1 );
+  lcd.print ( "button to start." );
+
+  while ( digitalRead ( pinOfButton ) != LOW );
+  delay ( 500 );
+  
+}
+
+// ----------------------------------------------------------------------------
+
 void formatDewDisplay () {
 
   // Set up display with labels and units...
@@ -549,7 +569,7 @@ void displayDewStatus (
   }
   switch ( dewState ) {
     case DP_SAFE:
-      lcd.print ( "SAFE" );
+      lcd.print ( "SAFE " );
       break;
     case DP_NEAR:
       lcd.print ( "NEAR" );
