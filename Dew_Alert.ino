@@ -1,9 +1,9 @@
-// ****************************************************************************
+ // ****************************************************************************
 
 /*
  * DEW ALERT: Dew Point Detection and Warning System
  * -------------------------------------------------
- * Code by W.Witt; V1.00-beta-01; July 2016
+ * Code by W.Witt; V1.00-beta-02; July 2016
  *
  * The code below implements a dew point detection and warming system
  * It senses temperature and relative humidity, uses that data to
@@ -32,7 +32,7 @@
 
 // ----------------------------------------------------------------------------
 
-#define DEW_ALERT_VERSION_STRING "V1.00-beta-01"
+#define DEW_ALERT_VERSION_STRING "V1.00-beta-02"
 
 // ****************************************************************************
 
@@ -54,6 +54,7 @@
 // Inculde files for LED controller and hysteresis filter classes...
 #include <CwwLedController.h>
 #include <CwwFilterHysteresis.h>
+#include <CwwElapseTimer.h>
 
 // ----------------------------------------------------------------------------
 
@@ -146,9 +147,14 @@ const uint8_t pinOfButton = 8;
 // Instantiate two hysteresis filters, one for the distance to dew and
 // another for the ambient light...
 
-// Use three thresholds for dew, translating to four zones (from
+// Temperature margin to dew point is used for assessinig dew risk;
+// use three thresholds for dew, translating to four zones (from
 // low to high): DEW, WARN, NEAR and SAFE...
 CwwFilterHysteresis dewPointMarginFilter ( 3 );
+
+// Similar to dew point margin filter, set up another filter for
+// dew risk purely based on relative humidity percentage...
+CwwFilterHysteresis humidityFilter ( 3 );
 
 // Use two thresholds for light level, translating to three zones
 // (from low to high): LOW, MED, HIGH...
@@ -160,8 +166,14 @@ CwwFilterHysteresis ambientLightLevelFilter ( 2 );
 
 // ----------------------------------------------------------------------------
 
+// State variable to hold current dew state...
 enumDewState   dewState;
+
+// State variable to track ambient light level...
 enumLightLevel lightLevel;
+
+// Timer to control how frequently to update LCD panel...
+CwwElapseTimer displayTimer ( 1000 );  // display refresh rate of one second
 
 // ============================================================================
 
@@ -195,12 +207,21 @@ void setup () {
   indicatorLedDew. initSyncHandshake ();
 #endif
 
-  // Define the three thresholds for the dew hysteresis filter
-  // (measurement unit for input value is degrees C)..
-  dewPointMarginFilter.defineThreshold ( 0, 0.2, 0.1 );  // DEW/WARN threshold:  0.2C +/- 0.1C
-  dewPointMarginFilter.defineThreshold ( 1, 1.0, 0.1 );  // WARN/NEAR threshold: 1.0C +/- 0.1C
-  dewPointMarginFilter.defineThreshold ( 2, 2.5, 0.1 );  // NEAR/SAFE threshold: 2.5C +/- 0.1C
-  dewPointMarginFilter.initHistory ( 5.0 );  // arbitrarily start filter assuming 5C to dew point
+  // Define the three temperature margin thresholds for the dew
+  // point hysteresis filter (measurement unit for input value is
+  // degrees C)...
+  dewPointMarginFilter.defineThreshold ( 0, 0.5, 0.1 );  // DEW/WARN threshold:  0.5C +/- 0.1C
+  dewPointMarginFilter.defineThreshold ( 1, 3.0, 0.1 );  // WARN/NEAR threshold: 3.0C +/- 0.1C
+  dewPointMarginFilter.defineThreshold ( 2, 5.0, 0.1 );  // NEAR/SAFE threshold: 5.0C +/- 0.1C
+  dewPointMarginFilter.initHistory ( 10.0 );  // arbitrarily start filter assuming 10C to dew point
+
+  // Similarly, define three relative humidity thresholds for the
+  // alternate dew point hysteresis filter (measurement unit for
+  // input value is relative humidity percent)...
+  humidityFilter.defineThreshold ( 0, 65.0, 1.0 );  // DEW/WARN threshold:  65% +/- 1%
+  humidityFilter.defineThreshold ( 1, 80.0, 1.0 );  // WARN/NEAR threshold: 80% +/- 1%
+  humidityFilter.defineThreshold ( 2, 95.0, 1.0 );  // NEAR/SAFE threshold: 95% +/- 1%
+  humidityFilter.initHistory ( 25.0 );  // arbitrarily start filter assuming 25% humidity
 
   // Define the two thresholds for the ambient light hysteresis 
   // filter (measurement unit for input value is 0-1023 analogRead()
@@ -224,6 +245,7 @@ void setup () {
 
   // Get display ready to show temperature, humidity and dew status...
   formatDewDisplay ();
+  displayTimer.start ();
 
   // Start dew tracking state in reset state (i.e. real state is unknown)...
   dewState = DP_RESET;
@@ -235,93 +257,112 @@ void setup () {
 // Code in loop() keeps running after setup...
 void loop () {
 
-  float   sensorTemperatureDegC;
-  float   sensorHumidtyPercent;
-  float   dewPointTemperatureDegC;
-  float   marginToDewDegC;
-  uint8_t marginToDewQuantized;
+  float        sensorTemperatureDegC;
+  float        sensorHumidityPercent;
+  float        dewPointTemperatureDegC;
+  float        marginToDewDegC;
+  uint8_t      marginToDewQuantized;
+  uint8_t      marginToH100Quantized;
+  uint8_t      effectiveMargin;
+  boolean      humIsTrigger;
+  enumDewState dewStateNext;
 
   // Checkc ambient light level and adapt indicator LEDs accordingly...
   updateLightLevel ();
 
   // Read primary environmental sensor...
   sensorTemperatureDegC = bme280.readTemperature ();
-  sensorHumidtyPercent  = bme280.readHumidity ();
+  sensorHumidityPercent = bme280.readHumidity ();
 
   // Calculate dew point temperature from current temperature and
   // relative humidity values...
-  dewPointTemperatureDegC = tempOfDewPoint1 ( sensorHumidtyPercent, sensorTemperatureDegC );
+  dewPointTemperatureDegC = tempOfDewPoint1 ( sensorHumidityPercent, sensorTemperatureDegC );
   // Calculate margin from current temperature to dew-point temperature...
   marginToDewDegC = sensorTemperatureDegC - dewPointTemperatureDegC;
+
+  // Assess dew risk with two parallel methods:
+  // 1. temperature margin to dew point
+  // 2. margin to 100% relative humidity
+  // Note that dew may form on items long before the temperature
+  // reaches the dew point and relative humidity reaches 100%.
+
   // Run temperature margin through hysteresis filter; map margin value
   // to detection zone...
   marginToDewQuantized = dewPointMarginFilter.mapValueToZone ( marginToDewDegC );
+  // Similarly, run relative humidity through hysteresis filter...
+  marginToH100Quantized = humidityFilter.zoneCount() -
+                          humidityFilter.mapValueToZone ( sensorHumidityPercent );
 
-  // Map zone to state and update dew state...
-  switch ( marginToDewQuantized ) {
+  // Take the worst case (smallest margin) of the two...
+  effectiveMargin = min ( marginToDewQuantized, marginToH100Quantized );
+  humIsTrigger = marginToH100Quantized  < marginToDewQuantized;
+
+  // Map zone to new dew state...
+  switch ( effectiveMargin ) {
     case 0:  // zone below dew point; there's dew now
       // If this zone was newly reached from another, non-DEW zone,
       // go to alarm sub-state first; otherwise, just stay in DEW...
-      if ( dewState != DP_DEW  ) dewState = DP_DEW_ALARM;
+      if ( dewState != DP_DEW  ) {
+        if ( digitalRead ( pinOfButton ) == LOW ) dewStateNext = DP_DEW;
+        else                                      dewStateNext = DP_DEW_ALARM;
+      }
+      else {
+        dewStateNext = DP_DEW;
+      }
       break;
     case 1:  // zone just before dew point; time to prepare
       // If this zone was was reached from NEAR or SAFE, then
       // start with alarm first...
-      if ( dewState == DP_SAFE || dewState == DP_NEAR ) dewState = DP_WARN_ALARM;
-      else                                              dewState = DP_WARN;
+      if ( dewState != DP_WARN ) {
+        if ( digitalRead ( pinOfButton ) == LOW ) dewStateNext = DP_WARN;
+        else                                      dewStateNext = DP_WARN_ALARM;
+      }
+      else {
+        dewStateNext = DP_WARN;
+      }
       break;
     case 2:  // zone near dew point, but no reason to panic
-      dewState = DP_NEAR;
+      dewStateNext = DP_NEAR;
       break;
     case 3:  // zone far away from dew point; safe
-      dewState = DP_SAFE;
+      dewStateNext = DP_SAFE;
       break;
   }
 
-  // Map computed dew state to indicator behavior...
-  switch ( dewState ) {
-    case DP_SAFE:
-      indicatorLedSafe.turnHigh ();
-      indicatorLedWarn.turnOff  ();
-      indicatorLedDew. turnOff  ();
-      break;
-    case DP_NEAR:
-      indicatorLedSafe.turnOff   ();
-      indicatorLedWarn.oscillate ();
-      indicatorLedDew. turnOff   ();
-      break;
-    case DP_WARN_ALARM:
-      // Sound audible alarm until button is pressed to
-      // acknowledge alarm...
-      if ( digitalRead ( pinOfButton ) == LOW ) {
-        dewState = DP_WARN;
-        indicatorBuzzer.turnOff ();
-      }
-      else {
-        indicatorBuzzer.blink ();        
-      }
-    case DP_WARN:
-      indicatorLedSafe.turnOff   ();
-      indicatorLedWarn.turnHigh  ();
-      indicatorLedDew. oscillate ();
-      break;
-    case DP_DEW_ALARM:
-      // Sound audible alarm until button is pressed to
-      // acknowledge alarm...
-      if ( digitalRead ( pinOfButton ) == LOW ) {
-        indicatorBuzzer.turnOff ();
-        dewState = DP_DEW;
-      }
-      else {
-        indicatorBuzzer.turnOn ();
-      }
-    case DP_DEW:
-      indicatorLedSafe.turnOff ();
-      indicatorLedWarn.turnOff ();
-      indicatorLedDew. blink   ();
-      break;
+  // If the dew state has changed, modify indicator behavior
+  // accordingly...
+  if ( dewStateNext != dewState ) {
+    dewState = dewStateNext;
+    switch ( dewState ) {
+      case DP_SAFE:
+        indicatorLedSafe.turnHigh ();
+        indicatorLedWarn.turnOff  ();
+        indicatorLedDew. turnOff  ();
+        break;
+      case DP_NEAR:
+        indicatorLedSafe.turnOff   ();
+        indicatorLedWarn.oscillate ();
+        indicatorLedDew. turnOff   ();
+        break;
+      case DP_WARN_ALARM:
+      case DP_WARN:
+        if ( dewState == DP_WARN_ALARM ) indicatorBuzzer.blink   ();
+        else                             indicatorBuzzer.turnOff ();
+        indicatorLedSafe.turnOff   ();
+        indicatorLedWarn.turnHigh  ();
+        indicatorLedDew. oscillate ();
+        break;
+      case DP_DEW_ALARM:
+      case DP_DEW:
+        if ( dewState == DP_DEW_ALARM ) indicatorBuzzer.turnOn  ();
+        else                            indicatorBuzzer.turnOff ();
+        indicatorLedSafe.turnOff ();
+        indicatorLedWarn.turnOff ();
+        indicatorLedDew. blink   ();
+        break;
+    }
   }
-
+ 
   // Update all indicator LEDs and buzzer...
   indicatorLedSafe.updateNow ();
   indicatorLedWarn.updateNow ();
@@ -329,15 +370,19 @@ void loop () {
   indicatorBuzzer. updateNow ();
 
   // Update LCD panel...
-  displayDewStatus (
-    sensorTemperatureDegC,
-    sensorHumidtyPercent,
-    dewPointTemperatureDegC,
-    dewState
-  );
+  if ( displayTimer.hasElapsed() ) {
+    displayDewStatus (
+      sensorTemperatureDegC,
+      sensorHumidityPercent,
+      dewPointTemperatureDegC,
+      dewState,
+      humIsTrigger
+    );
+    displayTimer.restart ();
+  }
 
   // Sleep a bit before next sense/update iteration...
-  delay ( 20 );
+  delay ( 10 );
 
 }
 
@@ -359,15 +404,15 @@ void updateLightLevel () {
   if ( (enumLightLevel) ldrZone != lightLevel ) {
     switch ( (enumLightLevel) ldrZone ) {
       case LIGHT_LOW:
-        indicatorLedSafe.setLevelMax (  25 );
-        indicatorLedWarn.setLevelMax (  25 );
+        indicatorLedSafe.setLevelMax (  20 );
+        indicatorLedWarn.setLevelMax (  20 );
         indicatorLedDew. setLevelMax (  75 );
         lightLevel = LIGHT_LOW;
         break;
       case LIGHT_MED:
         indicatorLedSafe.setLevelMax ( 100 );
         indicatorLedWarn.setLevelMax ( 100 );
-        indicatorLedDew. setLevelMax ( 150 );
+        indicatorLedDew. setLevelMax ( 125 );
         lightLevel = LIGHT_MED;
         break;
       case LIGHT_HIGH:
@@ -467,7 +512,8 @@ void displayDewStatus (
   float        currTempDegC,
   float        currHumPercent,
   float        dewTempDegC,
-  enumDewState dewState
+  enumDewState dewState,
+  boolean      humIsTrigger
 ) {
 
   char currTempText[6];  // for format: -##.# (sign may be + or -)
@@ -480,25 +526,41 @@ void displayDewStatus (
 
   lcd.setCursor (  3, 0 );
   lcd.print ( currTempText );
+  
   lcd.setCursor ( 12, 0 );
   lcd.print ( currHumText  );
+  
   lcd.setCursor (  3, 1 );
   lcd.print ( dewTempText );
-  lcd.setCursor ( 11, 1 );
+ 
+  lcd.setCursor ( 10, 1 );
   switch ( dewState ) {
     case DP_SAFE:
-      lcd.print ( "SAFE " );
+      lcd.print ( " " );
       break;
     case DP_NEAR:
-      lcd.print ( "NEAR " );
+    case DP_WARN:
+    case DP_WARN_ALARM:
+    case DP_DEW:
+    case DP_DEW_ALARM:
+      if ( humIsTrigger ) lcd.print ( "H-" );
+      else                lcd.print ( "T-" );
+      break;
+  }
+  switch ( dewState ) {
+    case DP_SAFE:
+      lcd.print ( "SAFE" );
+      break;
+    case DP_NEAR:
+      lcd.print ( "NEAR" );
       break;
     case DP_WARN:
     case DP_WARN_ALARM:
-      lcd.print ( "WARN " );
+      lcd.print ( "WARN" );
       break;
     case DP_DEW:
     case DP_DEW_ALARM:
-      lcd.print ( "*DEW*" );
+      lcd.print ( "DEW!" );
       break;
   }
   
