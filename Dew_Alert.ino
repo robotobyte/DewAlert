@@ -3,7 +3,7 @@
 /*
  * DEW ALERT: Dew Point Detection and Warning System
  * -------------------------------------------------
- * Code by W.Witt; V1.00-beta-04; August 2016
+ * Code by W.Witt; V1.00-beta-05; September 2016
  *
  * The code below implements a dew point detection and warming system
  * It senses temperature and relative humidity, uses that data to
@@ -40,7 +40,7 @@
 
 // ----------------------------------------------------------------------------
 
-#define DEW_ALERT_VERSION_STRING "V1.00-beta-04"
+#define DEW_ALERT_VERSION_STRING "V1.00-beta-05"
 
 // ----------------------------------------------------------------------------
 // Pin Assignments:
@@ -100,7 +100,7 @@
 // Include file for advanced math functions (e.g. log)... 
 #include <math.h>
 
-// Include files for handy button-debounce and timer functions...
+// Include files for handy button-debounce and timer classes...
 #include <CwwButton.h>
 #include <CwwElapseTimer.h>
 
@@ -121,6 +121,10 @@
 #define LCD_BACKLIGHT_ON  0x01  // back-light red
 #define LCD_BACKLIGHT_OFF 0x00  // back-light off
 
+// For time-limited audible alarm mode, repeat limited alarm every
+// LIMITED_ALARM_REPEAT_MINUTES minutes (0 means no repeat)...
+#define LIMITED_ALARM_REPEAT_MINUTES 5
+
 // ----------------------------------------------------------------------------
 
 // Enumerated type for the state of the ambient light...
@@ -134,22 +138,31 @@ enum enumLightLevel {
 // Enumerated type for the state of the dew detector (i.e. how close
 // ambient conditions are to the dew point)...
 enum enumDewState {
-  DP_RESET,
-  DP_SAFE,
-  DP_NEAR,
-  DP_WARN_ALARM,
-  DP_WARN,
-  DP_DEW_ALARM,
-  DP_DEW
+  DP_RESET      = 0,
+  DP_SAFE       = 1,
+  DP_NEAR       = 2,
+  DP_WARN_ALARM = 3,
+  DP_WARN       = 4,
+  DP_DEW_ALARM  = 5,
+  DP_DEW        = 6
 };
+
+// Enumerated type for audible alarm modes...
+enum enumAlarmMode {
+  ALARM_NONE      = 0,  // no audible alarm
+  ALARM_LIMITED   = 1,  // automatically time-limited alarm
+  ALARM_SUSTAINED = 2   // sustained alarm (until cancelled by user)
+};
+// If the alarm modes are changed (some added or deleted), also fix up
+// associated code in setConfigFromUser function.
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 struct dewConfigStruct {
-  float   thTempMarginC [3];
-  float   thHumPercent  [3];
-  boolean showTempAsF;
-  boolean soundAlarm;
+  float         thTempMarginC [3];
+  float         thHumPercent  [3];
+  boolean       showTempAsF;
+  enumAlarmMode audibleAlarmMode;
   // For threshold arrays, indexes are:
   // 0: DEW/WARN threshold
   // 1: WARN/NEAR threshold
@@ -177,11 +190,11 @@ const uint8_t pinOfLdr = A0;
 //    R = sqrt( LDR_max / LDR_min ) * LDR_min
 // where LDR_max and LDR_min are the highest (fully dark) and lowest (fully
 // lit) resistance values of the light-dependent resistor, respectively.
-// For a 200 to 300k ohm LDR, the optimal resistor is 7.7k ohm, but using
+// For a 300 to 2000k ohm LDR, the optimal resistor is 7.7k ohm, but using
 // 10k ohm because it's much easier to find and close enough.
 // The range of values that may be read from the analog pin (after analog-
 // to-digital conversion) depends on LDR and series resistor values.
-// With LDR of 300 to 200k ohm and series resistor of 10k ohm, expected
+// With LDR of 300 to 2000k ohm and series resistor of 10k ohm, expected
 // pin value range is 49 through 994 (out of 0 to 1023).
 
 // Instantiate LED controller objects for primary indicator lights
@@ -195,10 +208,16 @@ CwwLedController indicatorLedDew  ( 11, true );  // Assume red LED
 // Use another LED controller object for a piezo buzzer...
 CwwLedController indicatorBuzzer  ( 12, false );
 
-// And two more LED controllers for the power button and an lit
+// And two more LED controllers for the power button and a lit
 // enter button...
-CwwLedController powerButtonLight (  5, true );
-CwwLedController enterButtonLight (  6, true );
+CwwLedController powerButtonLight ( 5, true );
+CwwLedController enterButtonLight ( 6, true );
+
+// Create special action sequences for LED controllers that handle
+// the buzzer and the enter button for time-limited audible and visual
+// alarm...
+CwwLedSequence limitedAlarmSequenceWarn;
+CwwLedSequence limitedAlarmSequenceDew;
 
 // Create object for momentary off(on) push button for enter function...
 CwwButton buttonEnter ( 2, 10 );  // pin 2, debounce time of 10ms
@@ -242,11 +261,11 @@ enumDewState   dewState;
 enumLightLevel lightLevel;
 
 // Timer to control how frequently to update LCD panel...
-CwwElapseTimer displayTimer ( 1000 );  // display refresh rate of one second
+CwwElapseTimer displayTimer ( 1000 );  // display refresh rate of once per second
 
 // Miscellaneous operating state flags...
 boolean showTempAsF;
-boolean soundAlarm;
+boolean audibleAlarmMode;
 boolean inTestMode;
 
 // ============================================================================
@@ -276,12 +295,41 @@ void setup () {
   // Enter button will light/blink just like buzzer...
   enterButtonLight.setBlinkPeriod ( 500 );
 
+  // Define time-limited buzzer sequence for WARN alarm...
+  limitedAlarmSequenceWarn.addStep (   0, LED_HIGH );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+#if LIMITED_ALARM_REPEAT_MINUTES > 0
+  limitedAlarmSequenceWarn.addStep ( 250, LED_HIGH );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_HIGH );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_HIGH );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_HIGH );
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+  limitedAlarmSequenceWarn.addStep ( LIMITED_ALARM_REPEAT_MINUTES*60000L, LED_LOW );
+  limitedAlarmSequenceWarn.setRepeatCount ( 0 );
+#else
+  limitedAlarmSequenceWarn.addStep ( 250, LED_LOW  );
+  limitedAlarmSequenceWarn.setRepeatCount ( 5 );
+#endif
+
+  // Define time-limited buzzer sequence for DEW alarm...
+  limitedAlarmSequenceDew.addStep (   0,  LED_HIGH );
+  limitedAlarmSequenceDew.addStep ( 5000, LED_LOW  );
+#if LIMITED_ALARM_REPEAT_MINUTES > 0
+  limitedAlarmSequenceWarn.addStep ( LIMITED_ALARM_REPEAT_MINUTES*60000L, LED_LOW );
+  limitedAlarmSequenceWarn.setRepeatCount ( 0 );
+#else
+  limitedAlarmSequenceWarn.setRepeatCount ( 1 );
+#endif
+
   // Check for magic button press to allow user a chance to enter
   // configuration mode and either set configuration by hand or
   // reset configuration to defaults: enter button down for 3
   // seconds to enter configuration mode, another 5 seconds to
   // perform factory reset...
-  delay ( 250 );
+  delay ( 500 );
   if ( buttonEnter.isLowStable() ) {
     configEntryTimer.start ( 3000 );
     while ( buttonEnter.isLow() && ! configEntryTimer.hasElapsed() );
@@ -312,7 +360,7 @@ void setup () {
   // Save temperature display and audible alarm modes for global
   // consumption (e.g. for use by loop function)...
   showTempAsF = dewConfig.showTempAsF;
-  soundAlarm  = dewConfig.soundAlarm;
+  audibleAlarmMode  = dewConfig.audibleAlarmMode;
   
   // Similarly, define three relative humidity thresholds for the
   // alternate dew point hysteresis filter; measurement unit for
@@ -490,7 +538,7 @@ void loop () {
     case 1:  // zone just before dew point; time to prepare
       // If this zone was was reached from NEAR or SAFE, then
       // start with alarm first...
-      if ( dewState != DP_WARN && dewState != DP_DEW ) {
+      if ( dewState != DP_WARN && dewState != DP_DEW && dewState != DP_DEW_ALARM ) {
         if ( buttonEnter.isLowStable() ) dewStateNext = DP_WARN;
         else                             dewStateNext = DP_WARN_ALARM;
       }
@@ -514,46 +562,74 @@ void loop () {
       case DP_SAFE:
         indicatorLedSafe.turnHigh  ();
         indicatorLedWarn.turnOff   ();
-        indicatorLedDew. turnOff   ();
+        indicatorLedDew .turnOff   ();
         indicatorBuzzer .turnOff   ();
         enterButtonLight.turnOff   ();
         break;
       case DP_NEAR:
         indicatorLedSafe.turnOff   ();
         indicatorLedWarn.oscillate ();
-        indicatorLedDew. turnOff   ();
+        indicatorLedDew .turnOff   ();
         indicatorBuzzer .turnOff   ();
         enterButtonLight.turnOff   ();
         break;
       case DP_WARN_ALARM:
   	    lcd.setBacklight ( LCD_BACKLIGHT_ON  );
       case DP_WARN:
-        if ( dewState == DP_WARN_ALARM && soundAlarm ) {
-          indicatorBuzzer. blink    ();
-          enterButtonLight.blink    ();
+        if ( dewState == DP_WARN_ALARM ) {
+          switch ( audibleAlarmMode ) {
+            case ALARM_SUSTAINED:
+              indicatorBuzzer .blinkMax   ();
+              enterButtonLight.blinkLevel ();
+              break;
+            case ALARM_LIMITED:
+              indicatorBuzzer .installSequence ( &limitedAlarmSequenceWarn );
+              enterButtonLight.installSequence ( &limitedAlarmSequenceWarn );
+              indicatorBuzzer .startSequence ();
+              enterButtonLight.startSequence ();
+              break;
+            case ALARM_NONE:
+              indicatorBuzzer .turnOff ();
+              enterButtonLight.turnOff ();
+              break;
+          }
         }
         else {
-          indicatorBuzzer .turnOff  ();
-          enterButtonLight.turnOff  ();
+          indicatorBuzzer .turnOff ();
+          enterButtonLight.turnOff ();
         }
         indicatorLedSafe.turnOff   ();
         indicatorLedWarn.turnHigh  ();
-        indicatorLedDew. oscillate ();
+        indicatorLedDew .oscillate ();
         break;
       case DP_DEW_ALARM:
 	      lcd.setBacklight ( LCD_BACKLIGHT_ON  );
       case DP_DEW:
-        if ( dewState == DP_DEW_ALARM && soundAlarm ) {
-          indicatorBuzzer .turnOn   ();
-          enterButtonLight.turnHigh ();
+        if ( dewState == DP_DEW_ALARM ) {
+          switch ( audibleAlarmMode ) {
+            case ALARM_SUSTAINED:
+              indicatorBuzzer .turnOn   ();
+              enterButtonLight.turnHigh ();
+              break;
+            case ALARM_LIMITED:
+              indicatorBuzzer .installSequence ( &limitedAlarmSequenceDew );
+              enterButtonLight.installSequence ( &limitedAlarmSequenceDew );
+              indicatorBuzzer .startSequence ();
+              enterButtonLight.startSequence ();
+              break;
+            case ALARM_NONE:
+              indicatorBuzzer .turnOff ();
+              enterButtonLight.turnOff ();
+              break;
+          }
         }
         else {
-          indicatorBuzzer .turnOff  ();
-          enterButtonLight.turnOff  ();
+          indicatorBuzzer .turnOff ();
+          enterButtonLight.turnOff ();
         }
-        indicatorLedSafe.turnOff   ();
-        indicatorLedWarn.turnOff   ();
-        indicatorLedDew. blink     ();
+        indicatorLedSafe.turnOff    ();
+        indicatorLedWarn.turnOff    ();
+        indicatorLedDew .blinkLevel ();
         break;
     }
   }
@@ -562,8 +638,8 @@ void loop () {
   powerButtonLight.updateNow ();
   indicatorLedSafe.updateNow ();
   indicatorLedWarn.updateNow ();
-  indicatorLedDew. updateNow ();
-  indicatorBuzzer. updateNow ();
+  indicatorLedDew .updateNow ();
+  indicatorBuzzer .updateNow ();
   enterButtonLight.updateNow ();
 
   // Update display panel...
@@ -634,13 +710,13 @@ void runIndicatorLedTest () {
 
   indicatorLedSafe.turnOn  ();
   indicatorLedWarn.turnOn  ();
-  indicatorLedDew. turnOn  ();
+  indicatorLedDew .turnOn  ();
 
-  if ( soundAlarm ) {
+  if ( audibleAlarmMode != ALARM_NONE ) {
     delay ( 250 );
-    indicatorBuzzer. turnOn  ();
+    indicatorBuzzer.turnOn  ();
     delay ( 250 );
-    indicatorBuzzer. turnOff ();
+    indicatorBuzzer.turnOff ();
   }
   
   delay ( 500 );
@@ -658,13 +734,13 @@ void runIndicatorLedTest () {
 
   indicatorLedSafe.turnOff ();
   indicatorLedWarn.turnOff ();
-  indicatorLedDew. turnOff ();
+  indicatorLedDew .turnOff ();
   delay ( 500 );
 
-  indicatorLedDew. turnOn  ();
+  indicatorLedDew .turnOn  ();
   delay ( 500 );
   indicatorLedWarn.turnOn  ();
-  indicatorLedDew. turnOff ();
+  indicatorLedDew .turnOff ();
   delay ( 500 );
   indicatorLedSafe.turnOn  ();
   indicatorLedWarn.turnOff ();
@@ -691,7 +767,7 @@ void displayIntro () {
 
   lcd.clear ();
   lcd.setCursor ( 0, 0 );
-  lcd.print ( "* Dew Alert *" );
+  lcd.print ( "** Dew Alert **" );
   lcd.setCursor ( 0, 1 );
   lcd.print ( DEW_ALERT_VERSION_STRING );
 
@@ -891,7 +967,7 @@ void resetConfigToDefault () {
   dewConfig.thHumPercent[2]  = 95.0;  // DEW/WARN  threshold: 95%
   
   dewConfig.showTempAsF      = false;
-  dewConfig.soundAlarm       = true;
+  dewConfig.audibleAlarmMode = ALARM_SUSTAINED;
   
   EEPROM.put ( EEPROM_CONFIG_ADDRESS, dewConfig );
 
@@ -909,11 +985,14 @@ void resetConfigToDefault () {
 void setConfigFromUser () {
 
   dewConfigStruct dewConfig;
-  int8_t          thIndex;
+  
+  int8_t          configIndex;
   float           configValueMin;
   float           configValueMax;
   float           configValue;
   char            configValueStr [5];  // for format ##.#
+
+  enumAlarmMode   configAlarmMode;
 
   boolean         buttonPressed;
   CwwElapseTimer  btnRepeatTimer ( 500 );  // Button auto-repeat delay of 500ms
@@ -946,9 +1025,9 @@ void setConfigFromUser () {
   lcd.print ( "Temp Margin Thr." );
   lcd.setCursor ( 15, 1 );
   lcd.print ( dewConfig.showTempAsF ? "F" : "C" );
-  for ( thIndex = 0; thIndex <= 2; thIndex++ ) {
+  for ( configIndex = 0; configIndex <= 2; configIndex++ ) {
     lcd.setCursor ( 0, 1 );
-    switch ( thIndex ) {
+    switch ( configIndex ) {
       case 0:
         lcd.print ( "WARN/DEW " );
         configValueMin = 0.0;
@@ -965,7 +1044,7 @@ void setConfigFromUser () {
         configValueMax = 50.0;
         break;
     }
-    configValue = dewConfig.thTempMarginC[thIndex];
+    configValue = dewConfig.thTempMarginC[configIndex];
     if ( configValue < configValueMin ) configValue = configValueMin;
     if ( dewConfig.showTempAsF ) {
       configValue    = relativeTempCtoF ( configValue    );
@@ -994,7 +1073,7 @@ void setConfigFromUser () {
       }
     } while ( ! buttonEnter.isLowStable() );
     if ( dewConfig.showTempAsF ) configValue = relativeTempFtoC ( configValue );
-    dewConfig.thTempMarginC[thIndex] = configValue;
+    dewConfig.thTempMarginC[configIndex] = configValue;
     while ( ! buttonEnter.isHighStable() );
   } 
 
@@ -1003,9 +1082,9 @@ void setConfigFromUser () {
   lcd.print ( "Humidity Thresh." );
   lcd.setCursor ( 15, 1 );
   lcd.print ( "%" );
-  for ( thIndex = 2; thIndex >= 0; thIndex-- ) {
+  for ( configIndex = 2; configIndex >= 0; configIndex-- ) {
     lcd.setCursor ( 0, 1 );
-    switch ( thIndex ) {
+    switch ( configIndex ) {
       case 2:
         lcd.print ( "WARN/DEW " );
         configValueMin = 2.0 * HYSTERESIS_OFFSET_HUMIDITY_PERCENT;
@@ -1022,7 +1101,7 @@ void setConfigFromUser () {
         configValueMax = dewConfig.thHumPercent[1] - HYSTERESIS_OFFSET_HUMIDITY_PERCENT;
         break;
     }
-    configValue = dewConfig.thHumPercent[thIndex];
+    configValue = dewConfig.thHumPercent[configIndex];
     if ( configValue > configValueMax ) configValue = configValueMax;
     buttonPressed = false;
     do {
@@ -1045,21 +1124,40 @@ void setConfigFromUser () {
         buttonPressed = true;
       }
     } while ( ! buttonEnter.isLowStable() );
-    dewConfig.thHumPercent[thIndex] = configValue;
+    dewConfig.thHumPercent[configIndex] = configValue;
     while ( ! buttonEnter.isHighStable() );
   } 
 
   lcd.clear ();
   lcd.setCursor ( 0, 0 );
-  lcd.print ( "Use audible" );
+  lcd.print ( "Audible alarm" );
+  lcd.setCursor ( 0, 1 );
+  lcd.print ( "mode:" );
+  configAlarmMode = dewConfig.audibleAlarmMode;
   do {
-    lcd.setCursor ( 0, 1 );
-    lcd.print ( dewConfig.soundAlarm ? "alarm: YES" : "alarm: NO " );
-    if ( buttonUp.isLowStable() || buttonDown.isLowStable() ) {
-      dewConfig.soundAlarm = ! dewConfig.soundAlarm;
-      while ( ! ( buttonUp.isHighStable() && buttonDown.isHighStable() ) );
+    lcd.setCursor ( 6, 1 );
+    switch ( configAlarmMode ) {
+      case ALARM_SUSTAINED:
+        lcd.print ( "sustained" );
+        break;
+      case ALARM_LIMITED:
+        lcd.print ( "limited  " );
+        break;
+      case ALARM_NONE:
+        lcd.print ( "none     " );
+        break;
     }
+    if ( buttonUp.isLowStable()   ) {
+      if ( (int) configAlarmMode <= 2 ) configAlarmMode = (enumAlarmMode) ( (int) configAlarmMode + 1 );
+      else                              configAlarmMode = (enumAlarmMode) 0;
+    }
+    if ( buttonDown.isLowStable() ) {
+      if ( (int) configAlarmMode >= 0 ) configAlarmMode = (enumAlarmMode) ( (int) configAlarmMode - 1 );
+      else                              configAlarmMode = (enumAlarmMode) 2;
+    }
+    while ( ! ( buttonUp.isHighStable() && buttonDown.isHighStable() ) );
   } while ( ! buttonEnter.isLowStable() );
+  dewConfig.audibleAlarmMode = configAlarmMode;
   while ( ! buttonEnter.isHighStable() );
 
   EEPROM.put ( EEPROM_CONFIG_ADDRESS, dewConfig );
