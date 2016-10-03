@@ -3,9 +3,9 @@
 /*
  * DEW ALERT: Dew Point Detection and Warning System
  * -------------------------------------------------
- * Code by W.Witt; V1.00-beta-05; September 2016
+ * Code by W.Witt; V1.00-beta-06; September 2016
  *
- * The code below implements a dew point detection and warming system
+ * The code below implements a dew point detection and warning system
  * It senses temperature and relative humidity, uses that data to
  * calculate the dew point, and then provides an indication of how
  * close ambient conditions are to reaching the dew point. Based on the
@@ -13,9 +13,10 @@
  * that conditions are safe (i.e. far away from dew), the dew point is
  * near, the dew point is very close (warning condition) or the dew
  * point has been reached. Alternatively, proximity to the dew point
- * may be assessed purely based on relative humidity, and the overall
- * dew state is then computed based on worst case (i.e. smallest)
- * temperature margin or relative humidity margin.
+ * and associated dew formation risk may be assessed purely based on
+ * relative humidity, and the overall dew state is then computed based
+ * on worst case (i.e. smaller) of temperature margin and relative
+ * humidity margin.
  * 
  * The intended application for this environment monitor is to track
  * when equipment (e.g. telescopes during a night-time observing
@@ -27,9 +28,9 @@
  * based on ambient light level, such that the LEDs will not be
  * disturbingly bright during night-time conditions.
  * 
- * Additionally or alternatively, a small LCD panel displays the
- * measured temperature and relative humidity values, the calculated
- * dew point and the dew point state.
+ * Additionally a small LCD panel displays the measured temperature
+ * and relative humidity values, the calculated dew point and the dew
+ * point state.
  *
  * With the display in place, the temperature display mode (degrees
  * Celsius or Fahrenheit) and the various thresholds (e.g. NEAR/SAFE
@@ -40,7 +41,9 @@
 
 // ----------------------------------------------------------------------------
 
-#define DEW_ALERT_VERSION_STRING "V1.00-beta-05"
+// LCD Column:                    0123456789012345
+#define DEW_ALERT_NAME_STRING    "** Dew Alert **"
+#define DEW_ALERT_VERSION_STRING "V1.00-beta-06"
 
 // ----------------------------------------------------------------------------
 // Pin Assignments:
@@ -54,8 +57,8 @@
  * Digital  0
  * Digital  1
  * Digital  2   Enter/Action button           Input         orange
- * Digital  3   LCD back-light LED, red       Output, PWM   --> actually via I2C
- * Digital  4
+ * Digital  3   LCD back-light LED, red       Output, PWM   (actually via I2C)
+ * Digital  4   Low-battery indication        Input(*)      white
  * Digital  5   Power button light            Output, PWM   white/blue
  * Digital  6   Enter/Action button light     Output, PWM   green
  * Digital  7   Up button                     Input         violet
@@ -73,6 +76,8 @@
  * Analog  A5   I2C SCL (clock)                             yellow
  *
  * I2C --> Temp/Humidity Sensor, LCD Display
+ * 
+ * (*) INPUT_PULLUP (provide external pull-up in next hardware revision?)
  *
  */
 
@@ -95,7 +100,7 @@
 // Include files for Adafruit LCD with I2C backpack...
 // LCD Panel: https://www.adafruit.com/products/399
 // I2C Backpack: https://www.adafruit.com/products/292
-#include "Adafruit_LiquidCrystal.h"
+#include <Adafruit_LiquidCrystal.h>
 
 // Include file for advanced math functions (e.g. log)... 
 #include <math.h>
@@ -151,7 +156,7 @@ enum enumDewState {
 enum enumAlarmMode {
   ALARM_NONE      = 0,  // no audible alarm
   ALARM_LIMITED   = 1,  // automatically time-limited alarm
-  ALARM_SUSTAINED = 2   // sustained alarm (until cancelled by user)
+  ALARM_SUSTAINED = 2   // sustained alarm (until canceled by user)
 };
 // If the alarm modes are changed (some added or deleted), also fix up
 // associated code in setConfigFromUser function.
@@ -179,10 +184,13 @@ Adafruit_LiquidCrystal lcd ( 0x00 );  // I2C address 0x00
 
 // ----------------------------------------------------------------------------
 
+// Define input pin for low-battery signal from power converter board...
+const uint8_t pinOfLowBat = 4;
+
 // Define pin of light sensor (light-dependent resistor, LDR) for ambient
 // light measurement...
 const uint8_t pinOfLdr = A0;
-// Prototype was built with 300 to 200k ohm light LDR. Wiring is
+// Prototype was built with 300 to 200k ohm LDR. Wiring is
 //   Power---LDR---Resistor---Ground
 // with pinOfLdr (analog input pin) connected between the LDR and the
 // resistor, and with the value of the resistor (R) at about 10k ohm. If
@@ -190,11 +198,11 @@ const uint8_t pinOfLdr = A0;
 //    R = sqrt( LDR_max / LDR_min ) * LDR_min
 // where LDR_max and LDR_min are the highest (fully dark) and lowest (fully
 // lit) resistance values of the light-dependent resistor, respectively.
-// For a 300 to 2000k ohm LDR, the optimal resistor is 7.7k ohm, but using
+// For a 300 to 200k ohm LDR, the optimal resistor is 7.7k ohm, but using
 // 10k ohm because it's much easier to find and close enough.
 // The range of values that may be read from the analog pin (after analog-
 // to-digital conversion) depends on LDR and series resistor values.
-// With LDR of 300 to 2000k ohm and series resistor of 10k ohm, expected
+// With LDR of 300 to 200k ohm and series resistor of 10k ohm, expected
 // pin value range is 49 through 994 (out of 0 to 1023).
 
 // Instantiate LED controller objects for primary indicator lights
@@ -208,8 +216,8 @@ CwwLedController indicatorLedDew  ( 11, true );  // Assume red LED
 // Use another LED controller object for a piezo buzzer...
 CwwLedController indicatorBuzzer  ( 12, false );
 
-// And two more LED controllers for the power button and a lit
-// enter button...
+// And two more LED controllers for the power button and the 
+// alternative, lit enter button (see primary enter button below)...
 CwwLedController powerButtonLight ( 5, true );
 CwwLedController enterButtonLight ( 6, true );
 
@@ -224,7 +232,7 @@ CwwButton buttonEnter ( 2, 10 );  // pin 2, debounce time of 10ms
 // Button is assumed active low, wired as
 //   Power---Resistor---Button---Ground
 // with the pin connected between the resistor and button.
-// Reasonable resistor value is between 1k and 10k ohm.
+// Reasonable resistor value is around 10k ohm.
 
 // Similarly, create objects for up and down navigation buttons...
 CwwButton buttonUp   ( 7, 10 );
@@ -263,10 +271,14 @@ enumLightLevel lightLevel;
 // Timer to control how frequently to update LCD panel...
 CwwElapseTimer displayTimer ( 1000 );  // display refresh rate of once per second
 
+// Another timer for displaying the low-battery alarm (when necessary)...
+CwwElapseTimer batteryTimer ( 3000 );
+
 // Miscellaneous operating state flags...
 boolean showTempAsF;
 boolean audibleAlarmMode;
 boolean inTestMode;
+boolean batteryIsOkay;
 
 // ============================================================================
 
@@ -282,7 +294,18 @@ void setup () {
 
   // Initialize display...
   initDisplay ();
-  displayIntro ();
+
+  // If battery is okay, say hello;
+  // otherwise, stop with low-battery message...
+  pinMode ( pinOfLowBat, INPUT_PULLUP );
+  batteryIsOkay = digitalRead(pinOfLowBat) == HIGH;
+  if ( batteryIsOkay ) {
+    displayIntro ();
+  }
+  else {
+    displayLowBat ();
+    while ( true );
+  }
 
   // Define periods for oscillating (fade-up/fade-down) or blinking
   // (on/off) indicator LEDs...
@@ -349,6 +372,11 @@ void setup () {
   // Load configuration from non-volatile memory...
   loadConfig ( &dewConfig );
 
+  // Save temperature display and audible alarm modes for global
+  // consumption (e.g. for use by loop function)...
+  showTempAsF      = dewConfig.showTempAsF;
+  audibleAlarmMode = dewConfig.audibleAlarmMode;
+  
   // Define the three temperature margin thresholds for the dew
   // point hysteresis filter; measurement unit for input value is
   // degrees C; use same hysteresis offset for all...
@@ -357,11 +385,6 @@ void setup () {
   dewPointMarginFilter.defineThreshold ( 2, dewConfig.thTempMarginC[2], HYSTERESIS_OFFSET_TEMP_MARGIN_C );  // NEAR/SAFE threshold
   dewPointMarginFilter.initHistory ( 10.0 );  // arbitrarily start filter assuming 10C to dew point
 
-  // Save temperature display and audible alarm modes for global
-  // consumption (e.g. for use by loop function)...
-  showTempAsF = dewConfig.showTempAsF;
-  audibleAlarmMode  = dewConfig.audibleAlarmMode;
-  
   // Similarly, define three relative humidity thresholds for the
   // alternate dew point hysteresis filter; measurement unit for
   // input value is relative humidity percent; use same hysteresis
@@ -389,7 +412,7 @@ void setup () {
 
   // Display ready message and get user to press button to start (partly
   // to test button works)...
-  displayReadyAndTestButton ();
+  displayReadyAndTestButton ( true );
 
   // Activate communication with primary environmental (temperature,
   // humidity) sensor...
@@ -438,6 +461,20 @@ void loop () {
   boolean      humIsTrigger;
   enumDewState dewStateNext;
 
+  // Check battery state, and issue alert if battery is low...
+  if ( ! batteryIsOkay || digitalRead(pinOfLowBat) == LOW ) {
+    if ( batteryIsOkay || batteryTimer.hasElapsed() ) {
+      displayLowBat ();
+      indicatorBuzzer.turnOn  ();
+      delay ( 200 );
+      indicatorBuzzer.turnOff ();
+      delay ( 800 ); 
+      formatDewDisplay ( showTempAsF );
+      batteryTimer.start ();
+    }   
+    batteryIsOkay = false;
+  }
+
   // Check ambient light level and adapt indicator LEDs accordingly...
   updateLightLevel ();
   
@@ -478,6 +515,9 @@ void loop () {
         effectiveMargin = 0;
         break;
     }
+
+    // Up and down buttons pressed together exit test mode, otherwise
+    // up and down buttons change state...
     if ( buttonUp.isLowStable() && buttonDown.isLowStable() ) {
       inTestMode = false;
       dewState = DP_RESET;
@@ -528,6 +568,8 @@ void loop () {
       // If this zone was newly reached from another, non-DEW zone,
       // go to alarm sub-state first; otherwise, just stay in DEW...
       if ( dewState != DP_DEW ) {
+        // Move from DEW_ALARM to DEW (i.e. allow user to cancel
+        // audible alarm) based on press of enter button...
         if ( buttonEnter.isLowStable() ) dewStateNext = DP_DEW;
         else                             dewStateNext = DP_DEW_ALARM;
       }
@@ -539,6 +581,8 @@ void loop () {
       // If this zone was was reached from NEAR or SAFE, then
       // start with alarm first...
       if ( dewState != DP_WARN && dewState != DP_DEW && dewState != DP_DEW_ALARM ) {
+        // Move from WARN_ALARM to WARN (i.e. allow user to cancel
+        // audible alarm) based on press of enter button...
         if ( buttonEnter.isLowStable() ) dewStateNext = DP_WARN;
         else                             dewStateNext = DP_WARN_ALARM;
       }
@@ -574,6 +618,7 @@ void loop () {
         enterButtonLight.turnOff   ();
         break;
       case DP_WARN_ALARM:
+        // Force LCD back-light on in case it had been turned off...
   	    lcd.setBacklight ( LCD_BACKLIGHT_ON  );
       case DP_WARN:
         if ( dewState == DP_WARN_ALARM ) {
@@ -603,6 +648,7 @@ void loop () {
         indicatorLedDew .oscillate ();
         break;
       case DP_DEW_ALARM:
+        // Force LCD back-light on in case it had been turned off...
 	      lcd.setBacklight ( LCD_BACKLIGHT_ON  );
       case DP_DEW:
         if ( dewState == DP_DEW_ALARM ) {
@@ -642,7 +688,7 @@ void loop () {
   indicatorBuzzer .updateNow ();
   enterButtonLight.updateNow ();
 
-  // Update display panel...
+  // Update display panel based on display refresh rate timer...
   if ( displayTimer.hasElapsed() ) {
     displayDewStatus (
       sensorTemperatureDegC,
@@ -666,7 +712,7 @@ void updateLightLevel () {
   uint16_t ldrValue;
   uint8_t  ldrZone;
 
-  // Sense ambient light level and run through hysteresis filter...
+  // Sense ambient light level and pass it through hysteresis filter...
   ldrValue = analogRead ( pinOfLdr );
   ldrZone = ambientLightLevelFilter.mapValueToZone ( ldrValue );
 
@@ -675,7 +721,7 @@ void updateLightLevel () {
   if ( (enumLightLevel) ldrZone != lightLevel ) {
     switch ( (enumLightLevel) ldrZone ) {
       case LIGHT_LOW:
-        powerButtonLight.setLevelMax (  10 );
+        powerButtonLight.setLevelMax (  05 );
         indicatorLedSafe.setLevelMax (  15 );
         indicatorLedWarn.setLevelMax (  15 );
         indicatorLedDew. setLevelMax (  50 );
@@ -683,7 +729,7 @@ void updateLightLevel () {
         lightLevel = LIGHT_LOW;
         break;
       case LIGHT_MED:
-        powerButtonLight.setLevelMax (  50 );
+        powerButtonLight.setLevelMax (  30 );
         enterButtonLight.setLevelMax (  50 );        
         indicatorLedSafe.setLevelMax ( 100 );
         indicatorLedWarn.setLevelMax ( 100 );
@@ -767,7 +813,7 @@ void displayIntro () {
 
   lcd.clear ();
   lcd.setCursor ( 0, 0 );
-  lcd.print ( "** Dew Alert **" );
+  lcd.print ( DEW_ALERT_NAME_STRING    );
   lcd.setCursor ( 0, 1 );
   lcd.print ( DEW_ALERT_VERSION_STRING );
 
@@ -775,17 +821,33 @@ void displayIntro () {
 
 // ----------------------------------------------------------------------------
 
-void displayReadyAndTestButton () {
+void displayReadyAndTestButton ( boolean autoTimeout ) {
+
+  CwwElapseTimer timeoutTimer;
 
   lcd.clear ();
   lcd.setCursor ( 0, 0 );
   lcd.print ( "READY! Press" );
   lcd.setCursor ( 0, 1 );
   lcd.print ( "Enter to Start." );
-
-  while ( ! buttonEnter.isLowStable() );
-  delay ( 500 );
   
+  if ( autoTimeout ) timeoutTimer.start ( 60000L * 5 );  // five minutes
+
+  while ( ! ( buttonEnter.isLowStable() || autoTimeout && timeoutTimer.hasElapsed() ) );
+  delay ( 500 );
+
+  // Instead of waiting for a button press, the timeout timer is another
+  // way past the READY! prompt. The timeout timer is a safety in case the
+  // battery is low, but a user has walked away and forgotten to pay
+  // attention to the device. Since the code is not checking for a low-
+  // battery condition while waiting for the button press, the battery
+  // could run down and over-discharge were it not for a failsafe. The
+  // timeout timer is this failsafe. The device will not indefinitely get
+  // stuck at the READY! prompt. When the timer expires, the code will
+  // advance to a state where battery conditions are checked and a low-
+  // battery alarm will sound if the battery is in danger of discharging
+  // too much.
+
 }
 
 // ----------------------------------------------------------------------------
@@ -873,6 +935,18 @@ void displayDewStatus (
       break;
   }
   
+}
+
+// ----------------------------------------------------------------------------
+
+void displayLowBat () {
+
+  lcd.clear ();
+  lcd.setCursor ( 0, 0 );
+  lcd.print ( "* BATTERY LOW *" );
+  lcd.setCursor ( 0, 1 );
+  lcd.print ( "Charge battery!" );
+
 }
 
 // ============================================================================
@@ -971,6 +1045,8 @@ void resetConfigToDefault () {
   
   EEPROM.put ( EEPROM_CONFIG_ADDRESS, dewConfig );
 
+  // Insert a short delay to give the user the impression that
+  // something happened...
   delay ( 750 );
   lcd.setCursor ( 0, 1 );
   lcd.print ( "Done." );
@@ -1149,11 +1225,11 @@ void setConfigFromUser () {
     }
     if ( buttonUp.isLowStable()   ) {
       if ( (int) configAlarmMode <= 2 ) configAlarmMode = (enumAlarmMode) ( (int) configAlarmMode + 1 );
-      else                              configAlarmMode = (enumAlarmMode) 0;
+      else                              configAlarmMode = (enumAlarmMode) 0;  // wrap-around
     }
     if ( buttonDown.isLowStable() ) {
       if ( (int) configAlarmMode >= 0 ) configAlarmMode = (enumAlarmMode) ( (int) configAlarmMode - 1 );
-      else                              configAlarmMode = (enumAlarmMode) 2;
+      else                              configAlarmMode = (enumAlarmMode) 2;  // wrap-around
     }
     while ( ! ( buttonUp.isHighStable() && buttonDown.isHighStable() ) );
   } while ( ! buttonEnter.isLowStable() );
